@@ -22,6 +22,23 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_VOICES_DIR = PROJECT_ROOT / "voices"
 DEFAULT_OUTPUTS_DIR = PROJECT_ROOT / "outputs"
 VOICE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+# F5-TTS sizes the spectrogram from reference audio plus the new text and
+# starts failing on MPS once that total passes roughly 22 seconds. Keep a
+# margin so a long reference voice still has room for each generated piece.
+_SPECTROGRAM_BUDGET_SEC = 16.0
+
+
+def generation_max_words(reference_audio: Path, reference_text: str, speed: float) -> int:
+    """How many words one inference step can speak for this reference clip."""
+    ref_sec = max(float(sf.info(reference_audio).duration), 0.4)
+    transcript = " ".join(reference_text.split())
+    words = transcript.split()
+    ref_bytes = max(len(transcript.encode("utf-8")), 1)
+    chars_per_sec = ref_bytes / ref_sec
+    remaining = max(3.0, _SPECTROGRAM_BUDGET_SEC - ref_sec)
+    max_chars = max(20, int(chars_per_sec * remaining * max(float(speed), 0.3)))
+    chars_per_word = ref_bytes / max(len(words), 1)
+    return max(4, min(24, int(max_chars / max(chars_per_word, 1.0))))
 
 
 class VoiceCloneError(RuntimeError):
@@ -157,7 +174,8 @@ class VoiceCloneEngine:
             raise ValueError("nfe_step must be at least 1")
 
         reference_audio, reference_text = self._resolve_voice_profile(voice_name)
-        chunks = split_text(normalized_text, min_words=20, max_words=40)
+        max_words = generation_max_words(reference_audio, reference_text, speed)
+        chunks = split_text(normalized_text, min_words=min(8, max_words), max_words=max_words)
         self.load_model()
 
         started_at = time.perf_counter()
@@ -165,9 +183,10 @@ class VoiceCloneEngine:
         temporary_path = output_path.with_suffix(".tmp.wav")
 
         LOGGER.info(
-            "Starting synthesis voice=%s chunks=%d speed=%.2f nfe_step=%d device=%s",
+            "Starting synthesis voice=%s chunks=%d max_words=%d speed=%.2f nfe_step=%d device=%s",
             voice_name,
             len(chunks),
+            max_words,
             speed,
             nfe_step,
             self.device,
@@ -276,6 +295,7 @@ class VoiceCloneEngine:
                 raise SynthesisError("F5-TTS returned inconsistent sample rates")
 
             waveforms.append(chunk_audio)
+            self._release_device_cache()
             if index < len(chunks):
                 silence_length = round(sample_rate * 0.25)
                 silence_shape = (silence_length, *chunk_audio.shape[1:])
